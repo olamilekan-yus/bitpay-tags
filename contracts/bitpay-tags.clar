@@ -229,3 +229,116 @@
 (define-read-only (is-contract-paused)
   (var-get contract-paused)
 )
+
+;; Batch get multiple tags
+(define-read-only (get-multiple-tags (tag-ids (list 20 uint)))
+  (ok (map get-tag-safe tag-ids))
+)
+
+;; Helper for batch operations
+(define-private (get-tag-safe (tag-id uint))
+  (map-get? payment-tags { id: tag-id })
+)
+
+;; Public Functions
+
+;; Create a new payment tag
+(define-public (create-payment-tag
+    (recipient principal)
+    (amount uint)
+    (expires-in-blocks uint)
+    (memo (optional (string-ascii 256)))
+  )
+  (let (
+      (new-tag-id (+ (var-get tag-counter) u1))
+      (expiration-block (+ stacks-block-height expires-in-blocks))
+    )
+    (begin
+      ;; Contract state checks
+      (asserts! (not (var-get contract-paused)) (err ERR-UNAUTHORIZED))
+      ;; Input validation
+      (asserts! (>= amount MIN-PAYMENT-AMOUNT) (err ERR-INVALID-AMOUNT))
+      (asserts! (<= expires-in-blocks MAX-EXPIRATION-BLOCKS)
+        (err ERR-MAX-EXPIRATION-EXCEEDED)
+      )
+      (asserts! (> expires-in-blocks u0) (err ERR-INVALID-AMOUNT))
+      (asserts! (not (is-eq tx-sender recipient)) (err ERR-SELF-PAYMENT))
+      ;; Validate memo if provided
+      (match memo
+        some-memo (asserts! (> (len some-memo) u0) (err ERR-EMPTY-MEMO))
+        true
+      )
+      ;; Create the payment tag
+      (map-set payment-tags { id: new-tag-id } {
+        creator: tx-sender,
+        recipient: recipient,
+        amount: amount,
+        created-at: stacks-block-height,
+        expires-at: expiration-block,
+        memo: memo,
+        state: STATE-PENDING,
+        payment-tx: none,
+        payment-block: none,
+      })
+      ;; Update counter
+      (var-set tag-counter new-tag-id)
+      ;; Update indexes
+      (add-to-creator-index tx-sender new-tag-id)
+      (add-to-recipient-index recipient new-tag-id)
+      ;; Update statistics
+      (increment-stat "tags-created")
+      ;; Emit creation event
+      (print {
+        event: "payment-tag-created",
+        tag-id: new-tag-id,
+        creator: tx-sender,
+        recipient: recipient,
+        amount: amount,
+        expires-at: expiration-block,
+        memo: memo,
+      })
+      (ok new-tag-id)
+    )
+  )
+)
+
+;; Fulfill a payment tag
+(define-public (fulfill-payment-tag (tag-id uint))
+  (let ((tag-data (unwrap! (map-get? payment-tags { id: tag-id }) (err ERR-NOT-FOUND))))
+    (begin
+      ;; Contract state checks
+      (asserts! (not (var-get contract-paused)) (err ERR-UNAUTHORIZED))
+      ;; Input validation
+      (asserts! (> tag-id u0) (err ERR-INVALID-AMOUNT))
+      (asserts! (<= tag-id (var-get tag-counter)) (err ERR-NOT-FOUND))
+      ;; Tag state validation
+      (asserts! (is-eq (get state tag-data) STATE-PENDING) (err ERR-NOT-PENDING))
+      (asserts! (< stacks-block-height (get expires-at tag-data))
+        (err ERR-EXPIRED)
+      )
+      ;; Execute sBTC transfer
+      (try! (contract-call? SBTC-CONTRACT transfer (get amount tag-data) tx-sender
+        (get recipient tag-data) none
+      ))
+      ;; Update tag state
+      (map-set payment-tags { id: tag-id }
+        (merge tag-data {
+          state: STATE-PAID,
+          payment-block: (some stacks-block-height),
+        })
+      )
+      ;; Update statistics
+      (increment-stat "tags-fulfilled")
+      ;; Emit fulfillment event
+      (print {
+        event: "payment-tag-fulfilled",
+        tag-id: tag-id,
+        payer: tx-sender,
+        recipient: (get recipient tag-data),
+        amount: (get amount tag-data),
+        payment-block: stacks-block-height,
+      })
+      (ok tag-id)
+    )
+  )
+)
