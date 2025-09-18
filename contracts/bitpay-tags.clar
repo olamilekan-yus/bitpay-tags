@@ -342,3 +342,84 @@
     )
   )
 )
+
+;; Cancel a payment tag (creator only)
+(define-public (cancel-payment-tag (tag-id uint))
+  (let ((tag-data (unwrap! (map-get? payment-tags { id: tag-id }) (err ERR-NOT-FOUND))))
+    (begin
+      ;; Input validation
+      (asserts! (> tag-id u0) (err ERR-INVALID-AMOUNT))
+      (asserts! (<= tag-id (var-get tag-counter)) (err ERR-NOT-FOUND))
+      ;; Authorization check
+      (asserts! (is-eq tx-sender (get creator tag-data)) (err ERR-UNAUTHORIZED))
+      ;; State validation
+      (asserts! (is-eq (get state tag-data) STATE-PENDING) (err ERR-NOT-PENDING))
+      ;; Update tag state
+      (map-set payment-tags { id: tag-id }
+        (merge tag-data { state: STATE-CANCELED })
+      )
+      ;; Update statistics
+      (increment-stat "tags-canceled")
+      ;; Emit cancellation event
+      (print {
+        event: "payment-tag-canceled",
+        tag-id: tag-id,
+        creator: tx-sender,
+      })
+      (ok tag-id)
+    )
+  )
+)
+
+;; Mark an expired tag (callable by anyone)
+(define-public (expire-payment-tag (tag-id uint))
+  (let ((tag-data (unwrap! (map-get? payment-tags { id: tag-id }) (err ERR-NOT-FOUND))))
+    (begin
+      ;; Input validation
+      (asserts! (> tag-id u0) (err ERR-INVALID-AMOUNT))
+      (asserts! (<= tag-id (var-get tag-counter)) (err ERR-NOT-FOUND))
+      ;; State validation
+      (asserts! (is-eq (get state tag-data) STATE-PENDING) (err ERR-NOT-PENDING))
+      (asserts! (is-tag-expired (get expires-at tag-data)) (err ERR-EXPIRED))
+      ;; Update tag state
+      (map-set payment-tags { id: tag-id }
+        (merge tag-data { state: STATE-EXPIRED })
+      )
+      ;; Update statistics
+      (increment-stat "tags-expired")
+      ;; Emit expiration event
+      (print {
+        event: "payment-tag-expired",
+        tag-id: tag-id,
+        expired-by: tx-sender,
+      })
+      (ok tag-id)
+    )
+  )
+)
+
+;; Administrative Functions
+
+;; Emergency pause (deployer only)
+(define-public (toggle-contract-pause)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERR-UNAUTHORIZED))
+    (var-set contract-paused (not (var-get contract-paused)))
+    (print {
+      event: "contract-pause-toggled",
+      paused: (var-get contract-paused),
+    })
+    (ok (var-get contract-paused))
+  )
+)
+
+;; Get contract version info
+(define-read-only (get-contract-info)
+  (ok {
+    name: "BitPay Tags",
+    version: "1.0.0",
+    deployer: CONTRACT-DEPLOYER,
+    total-tags: (var-get tag-counter),
+    paused: (var-get contract-paused),
+  })
+)
